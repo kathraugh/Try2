@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import random
 from datetime import datetime, timedelta
@@ -6,7 +8,9 @@ import discord
 from discord.ext import commands
 
 # ------------- CONFIG -------------
-TOKEN = os.environ["TOKEN"]
+
+# Read token from environment (Railway: DISCORD_TOKEN variable)
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Katie’s IDs — fully inserted
 GATE_ROLE_ID = 1444877012350013572
@@ -25,11 +29,14 @@ TIME_LIMIT_MINUTES = 10
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-pending_captchas = {}        # Stores captcha sessions
-verification_data = {}       # Stores verification progress
+# member.id -> captcha info
+pending_captchas: dict[int, dict] = {}
+# member.id -> verification info
+verification_data: dict[int, dict] = {}
 
 
 def create_math_captcha():
@@ -70,7 +77,8 @@ async def send_captcha(member: discord.Member):
 
 @bot.event
 async def on_ready():
-    print(f"🔥 Bot online as {bot.user} (ID: {bot.user.id})")
+    print("🔥 Bot online")
+    print(f"User: {bot.user} (ID: {bot.user.id})")
 
 
 @bot.event
@@ -93,9 +101,8 @@ async def on_member_join(member: discord.Member):
 
 
 @bot.event
-async def on_message(message):
-    await bot.process_commands(message)
-
+async def on_message(message: discord.Message):
+    # Ignore bot messages
     if message.author.bot:
         return
 
@@ -127,6 +134,9 @@ async def on_message(message):
                 "Welcome to **3701** — you’re almost in."
             )
 
+    # Make sure prefix commands still work
+    await bot.process_commands(message)
+
 
 async def handle_captcha(msg: discord.Message):
     user_id = msg.author.id
@@ -135,6 +145,9 @@ async def handle_captcha(msg: discord.Message):
         return
 
     guild = bot.get_guild(data["guild_id"])
+    if guild is None:
+        return
+
     member = guild.get_member(user_id)
 
     # Timeout check
@@ -176,7 +189,7 @@ async def handle_captcha(msg: discord.Message):
             )
 
 
-async def try_kick(member, reason_text):
+async def try_kick(member: discord.Member | None, reason_text: str):
     if not member:
         return
 
@@ -184,24 +197,27 @@ async def try_kick(member, reason_text):
         await member.send(
             f"{reason_text}\n\nYou can rejoin anytime.\n_Loyalty • Honor • Respect_"
         )
-    except:
+    except Exception:
         pass
 
     await log_message(member.guild, f"❌ {member.mention} failed captcha and was kicked.")
     await member.kick(reason="Failed captcha")
 
 
-async def captcha_pass(member):
+async def captcha_pass(member: discord.Member):
     guild = member.guild
 
     gate_role = guild.get_role(GATE_ROLE_ID)
     unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
 
-    if gate_role in member.roles:
+    if gate_role and gate_role in member.roles:
         await member.remove_roles(gate_role)
 
-    if unverified_role not in member.roles:
+    if unverified_role and unverified_role not in member.roles:
         await member.add_roles(unverified_role)
+
+    if member.id not in verification_data:
+        verification_data[member.id] = {}
 
     verification_data[member.id]["status"] = "unverified"
 
@@ -218,18 +234,18 @@ async def captcha_pass(member):
             "Leadership will unlock full access after review.\n"
             "_Loyalty • Honor • Respect_"
         )
-    except:
+    except Exception:
         pass
 
     await log_message(guild, f"✅ {member.mention} passed captcha — now unverified.")
 
 
-def is_lead(ctx):
+def is_lead(ctx: commands.Context) -> bool:
     return discord.utils.get(ctx.author.roles, id=LEADERSHIP_ROLE_ID) is not None
 
 
 @bot.command()
-async def verify(ctx, member: discord.Member, *, ign=None):
+async def verify(ctx: commands.Context, member: discord.Member, *, ign=None):
     if not is_lead(ctx):
         return
 
@@ -243,10 +259,10 @@ async def verify(ctx, member: discord.Member, *, ign=None):
     unverified = guild.get_role(UNVERIFIED_ROLE_ID)
     verified = guild.get_role(VERIFIED_ROLE_ID)
 
-    if unverified in member.roles:
+    if unverified and unverified in member.roles:
         await member.remove_roles(unverified)
 
-    if verified not in member.roles:
+    if verified and verified not in member.roles:
         await member.add_roles(verified)
 
     data["status"] = "verified"
@@ -262,7 +278,7 @@ async def verify(ctx, member: discord.Member, *, ign=None):
             "Welcome home. We’re glad you’re here.\n"
             "_Loyalty • Honor • Respect_"
         )
-    except:
+    except Exception:
         pass
 
     await ctx.send(f"✅ {member.mention} is now verified. Welcome to the kingdom. ⚔️")
@@ -270,7 +286,7 @@ async def verify(ctx, member: discord.Member, *, ign=None):
 
 
 @bot.command()
-async def reject(ctx, member: discord.Member, *, reason="No reason provided"):
+async def reject(ctx: commands.Context, member: discord.Member, *, reason="No reason provided"):
     if not is_lead(ctx):
         return
 
@@ -285,7 +301,7 @@ async def reject(ctx, member: discord.Member, *, reason="No reason provided"):
             "Fix the issue and try again anytime.\n"
             "_Loyalty • Honor • Respect_"
         )
-    except:
+    except Exception:
         pass
 
     await ctx.send(f"❌ Verification rejected for {member.mention} — **{reason}**")
@@ -293,15 +309,17 @@ async def reject(ctx, member: discord.Member, *, reason="No reason provided"):
 
 
 @bot.command()
-async def pending(ctx):
+async def pending(ctx: commands.Context):
     if not is_lead(ctx):
         return
 
     out = []
     for m in ctx.guild.members:
         d = verification_data.get(m.id)
-        if d and d["status"] == "pending":
-            out.append(f"- {m.mention} (joined {d['joined_at'].strftime('%Y-%m-%d')})")
+        if d and d.get("status") == "pending":
+            joined = d.get("joined_at")
+            joined_str = joined.strftime('%Y-%m-%d') if joined else "unknown"
+            out.append(f"- {m.mention} (joined {joined_str})")
 
     if not out:
         await ctx.send("Everyone’s behaving. No pending verifications right now.")
@@ -310,7 +328,7 @@ async def pending(ctx):
 
 
 @bot.command()
-async def kickunverified(ctx, days: int = 7):
+async def kickunverified(ctx: commands.Context, days: int = 7):
     if not is_lead(ctx):
         return
 
@@ -320,13 +338,13 @@ async def kickunverified(ctx, days: int = 7):
 
     kicked = []
     for m in guild.members:
-        if role in m.roles and m.joined_at and m.joined_at.replace(tzinfo=None) < cutoff:
+        if role and role in m.roles and m.joined_at and m.joined_at.replace(tzinfo=None) < cutoff:
             try:
                 await m.send(
                     f"⏰ Removed for not verifying within **{days} days**.\n"
                     "Rejoin anytime.\n_Loyalty • Honor • Respect_"
                 )
-            except:
+            except Exception:
                 pass
 
             await m.kick(reason="Too long unverified")
@@ -342,12 +360,15 @@ async def kickunverified(ctx, days: int = 7):
 
 
 @bot.command()
-async def checkname(ctx, member: discord.Member):
+async def checkname(ctx: commands.Context, member: discord.Member):
     if not is_lead(ctx):
         return
 
     d = verification_data.get(member.id, {})
     nickname = member.nick or member.name
+
+    joined = d.get("joined_at")
+    joined_str = joined.strftime('%Y-%m-%d %H:%M') if joined else "unknown"
 
     msg = (
         f"🧾 **Verification Check for {member.mention}:**\n"
@@ -355,14 +376,14 @@ async def checkname(ctx, member: discord.Member):
         f"• Status: `{d.get('status', 'unknown')}`\n"
         f"• IGN: `{d.get('ign', 'not recorded')}`\n"
         f"• Screenshot: {d.get('screenshot_link', 'none')}\n"
-        f"• Joined: `{d.get('joined_at').strftime('%Y-%m-%d %H:%M') if d.get('joined_at') else 'unknown'}`"
+        f"• Joined: `{joined_str}`"
     )
 
     await ctx.send(msg)
 
 
 @bot.command()
-async def verifyinfo(ctx):
+async def verifyinfo(ctx: commands.Context):
     await ctx.send(
         "📌 **Verification Required**\n\n"
         f"1️⃣ Post a screenshot of your in-game profile in <#{VERIFICATION_CHANNEL_ID}>\n"
@@ -372,4 +393,17 @@ async def verifyinfo(ctx):
     )
 
 
-bot.run(TOKEN)
+# ------------ ENTRYPOINT FOR RAILWAY ------------
+
+def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN environment variable is not set.\n"
+            "On Railway: Project → Variables → add DISCORD_TOKEN = your bot token."
+        )
+
+    bot.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
